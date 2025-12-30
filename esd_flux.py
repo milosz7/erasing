@@ -17,15 +17,31 @@ FluxPipeline.__call__ = esd_flux_call
 def load_flux_models(basemodel_id="black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16, device='cuda:0'):
     
     esd_transformer = FluxTransformer2DModel.from_pretrained(basemodel_id, subfolder="transformer", torch_dtype=torch_dtype).to(device)
-    pipe = FluxPipeline.from_pretrained(basemodel_id, 
+    pipe_orig = FluxPipeline.from_pretrained(basemodel_id,
                                         transformer=esd_transformer,
                                         vae=None,
                                         torch_dtype=torch_dtype, 
                                         use_safetensors=True).to(device)
-    
+
+    pipe = FluxPipeline.from_pretrained(basemodel_id,
+                                             transformer=esd_transformer,
+                                             vae=None,
+                                             torch_dtype=torch_dtype,
+                                             use_safetensors=True).to(device)
+    lora_config = LoraConfig(
+        r=RANK,
+        lora_alpha=RANK,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        bias="none",
+    )
+    pipe.transformer = get_peft_model(pipe.transformer, lora_config)
+    pipe.transformer.train()
+
     pipe.vae = AutoencoderTiny.from_pretrained("madebyollin/taef1", torch_dtype=torch_dtype).to(device)
-    
-    return pipe, esd_transformer
+    pipe_orig.vae = AutoencoderTiny.from_pretrained("madebyollin/taef1", torch_dtype=torch_dtype).to(device)
+
+    return pipe, pipe_orig
 
 def set_module(module, module_name, new_module):
 
@@ -106,39 +122,42 @@ if __name__=="__main__":
     criteria = torch.nn.MSELoss()
 
 
-    pipe, esd_transformer = load_flux_models(basemodel_id=basemodel_id, torch_dtype=torch_dtype, device=device)
+    pipe, pipe_orig = load_flux_models(basemodel_id=basemodel_id, torch_dtype=torch_dtype, device=device)
     pipe.set_progress_bar_config(disable=True)
 
-    pipe.vae.requires_grad_(False)
-    pipe.text_encoder.requires_grad_(False)
-    pipe.text_encoder.requires_grad_(False)
-    noise_scheduler_copy = copy.deepcopy(pipe.scheduler)
+    for pipeline in [pipe, pipe_orig]:
+        pipeline.vae.requires_grad_(False)
+        pipeline.text_encoder.requires_grad_(False)
+        pipeline.text_encoder.requires_grad_(False)
+
+    noise_scheduler_copy = copy.deepcopy(pipe.scheduler) # ?
 
 
     esd_param_names, esd_params = get_esd_trainable_parameters(esd_transformer, train_method=train_method)
-    optimizer = torch.optim.Adam(esd_params, lr=lr)
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, pipe.transformer.parameters()),
+        lr=lr
+    )
 
-    esd_param_dict = {}
-    for name, param in zip(esd_param_names, esd_params):
-        esd_param_dict[name] = param
+    # esd_param_dict = {}
+    # for name, param in zip(esd_param_names, esd_params):
+    #     esd_param_dict[name] = param
+    #
+    #
+    # base_params = copy.deepcopy(esd_params)
+    # base_param_dict = {}
+    # for name, param in zip(esd_param_names, base_params):
+    #     base_param_dict[name] = param
+    #     base_param_dict[name].requires_grad_(False)
 
 
-    base_params = copy.deepcopy(esd_params)
-    base_param_dict = {}
-    for name, param in zip(esd_param_names, base_params):
-        base_param_dict[name] = param
-        base_param_dict[name].requires_grad_(False)
-
-
-    prompts = [erase_concept, erase_concept_from, '']
-    if erase_concept_from is None:
-        prompts = [erase_concept, '', '']
+    prompts = [erase_concept, erase_concept_from, erase_concept_from] # '' (null) -> erase_from
     with torch.no_grad():
         # get prompt embeds
         prompt_embeds_all, pooled_prompt_embeds_all, text_ids = pipe.encode_prompt(prompts, prompt_2=prompts, max_sequence_length=max_sequence_length)
 
-        erase_prompt_embeds, erase_from_prompt_embeds, null_prompt_embeds = prompt_embeds_all.chunk(3)
-        erase_pooled_prompt_embeds, erase_from_pooled_prompt_embeds, null_pooled_prompt_embeds = pooled_prompt_embeds_all.chunk(3)
+        erase_prompt_embeds, erase_from_prompt_embeds, erase_from_prompt_embeds_neg = prompt_embeds_all.chunk(3)
+        erase_pooled_prompt_embeds, erase_from_pooled_prompt_embeds, erase_from_pooled_prompt_embeds_neg = pooled_prompt_embeds_all.chunk(3)
 
         model_input = pipe.vae.encode(torch.randn((1, 3, height, width)).to(torch_dtype).to(pipe.vae.device)).latents.cpu()
 
@@ -178,7 +197,7 @@ if __name__=="__main__":
                                                                 torch_dtype,
                                                                 )
         
-        
+       # TODO: edit
         for key, ft_module in esd_param_dict.items():
             set_module(pipe.transformer, key, ft_module)
         pipe.transformer.eval()
