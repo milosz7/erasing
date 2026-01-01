@@ -7,6 +7,7 @@ from safetensors.torch import save_file
 from diffusers import FluxPipeline, AutoencoderTiny
 from diffusers.models import FluxTransformer2DModel
 from diffusers.utils import make_image_grid
+from peft import LoraConfig, get_peft_model
 import argparse
 import copy
 
@@ -14,7 +15,7 @@ sys.path.append('.')
 from utils.flux_utils import esd_flux_call
 FluxPipeline.__call__ = esd_flux_call
 
-def load_flux_models(basemodel_id="black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16, device='cuda:0'):
+def load_flux_models(basemodel_id="black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16, device='cuda:0', lora_rank=16):
     
     esd_transformer = FluxTransformer2DModel.from_pretrained(basemodel_id, subfolder="transformer", torch_dtype=torch_dtype).to(device)
     pipe_orig = FluxPipeline.from_pretrained(basemodel_id,
@@ -29,8 +30,8 @@ def load_flux_models(basemodel_id="black-forest-labs/FLUX.1-dev", torch_dtype=to
                                              torch_dtype=torch_dtype,
                                              use_safetensors=True).to(device)
     lora_config = LoraConfig(
-        r=RANK,
-        lora_alpha=RANK,
+        r=lora_rank,
+        lora_alpha=lora_rank,
         init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
         bias="none",
@@ -132,24 +133,10 @@ if __name__=="__main__":
 
     noise_scheduler_copy = copy.deepcopy(pipe.scheduler) # ?
 
-
-    esd_param_names, esd_params = get_esd_trainable_parameters(esd_transformer, train_method=train_method)
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, pipe.transformer.parameters()),
         lr=lr
     )
-
-    # esd_param_dict = {}
-    # for name, param in zip(esd_param_names, esd_params):
-    #     esd_param_dict[name] = param
-    #
-    #
-    # base_params = copy.deepcopy(esd_params)
-    # base_param_dict = {}
-    # for name, param in zip(esd_param_names, base_params):
-    #     base_param_dict[name] = param
-    #     base_param_dict[name].requires_grad_(False)
-
 
     prompts = [erase_concept, erase_concept_from, erase_concept_from] # '' (null) -> erase_from
     with torch.no_grad():
@@ -197,9 +184,8 @@ if __name__=="__main__":
                                                                 torch_dtype,
                                                                 )
         
-       # TODO: edit
-        for key, ft_module in esd_param_dict.items():
-            set_module(pipe.transformer, key, ft_module)
+       #  for key, ft_module in esd_param_dict.items():
+       #      set_module(pipe.transformer, key, ft_module)
         pipe.transformer.eval()
         with torch.no_grad():
             xt = pipe(prompt_embeds=erase_prompt_embeds if erase_concept_from is None else erase_from_prompt_embeds,
@@ -214,22 +200,22 @@ if __name__=="__main__":
                     width=width,
                     ).images
             
-        for key, ft_module in base_param_dict.items():
-            set_module(pipe.transformer, key, ft_module)
+        # for key, ft_module in base_param_dict.items():
+        #     set_module(pipe.transformer, key, ft_module)
         with torch.no_grad():
-            noise_pred_null = pipe.transformer(
+            noise_pred_from_neg = pipe_orig.transformer(
                                 hidden_states=xt,
                                 # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transforme rmodel (we should not keep it but I want to keep the inputs same for the model for testing)
                                 timestep=timesteps / 1000,
                                 guidance=guidance,
-                                pooled_projections=null_pooled_prompt_embeds,
-                                encoder_hidden_states=null_prompt_embeds,
+                                pooled_projections=erase_from_pooled_prompt_embeds_neg,
+                                encoder_hidden_states=erase_from_prompt_embeds_neg,
                                 txt_ids=text_ids,
                                 img_ids=latent_image_ids,
                                 return_dict=False,
                             )[0]
             
-            noise_pred_from = pipe.transformer(
+            noise_pred_from = pipe_orig.transformer(
                                 hidden_states=xt,
                                 # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transforme rmodel (we should not keep it but I want to keep the inputs same for the model for testing)
                                 timestep=timesteps / 1000,
@@ -241,7 +227,7 @@ if __name__=="__main__":
                                 return_dict=False,
                             )[0]
             
-            noise_pred_erase = pipe.transformer(
+            noise_pred_erase = pipe_orig.transformer(
                                 hidden_states=xt,
                                 # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transforme rmodel (we should not keep it but I want to keep the inputs same for the model for testing)
                                 timestep=timesteps / 1000,
@@ -253,10 +239,8 @@ if __name__=="__main__":
                                 return_dict=False,
                             )[0]
             
-        for key, ft_module in esd_param_dict.items():
-            set_module(pipe.transformer, key, ft_module)
         pipe.transformer.train()
-        # erase model pred 
+        # erase model pred
         model_pred = pipe.transformer(
                         hidden_states=xt,
                         # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transforme rmodel (we should not keep it but I want to keep the inputs same for the model for testing)
@@ -270,15 +254,11 @@ if __name__=="__main__":
                     )[0]
         
         
-        target = noise_pred_from - negative_guidance * (noise_pred_erase - noise_pred_null)
+        target = noise_pred_from - negative_guidance * (noise_pred_erase - noise_pred_from_neg)
         loss = torch.mean(((model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1), 1,)
         loss = loss.mean()
         # backprop and update the parameters
         loss.backward()
-
-        grad_norm = esd_params[-1].grad
-        grad_norm = grad_norm.norm().item() if grad_norm is not None else -100.0
-
 
         optimizer.step()
         optimizer.zero_grad()
@@ -289,9 +269,7 @@ if __name__=="__main__":
 
         loss_history['esd_loss'] = loss_history.get('esd_loss', []) + [loss.item()]
         pbar.set_postfix({
-            'grad_norm': f'{grad_norm:.4f}',
             'esd_loss': f'{loss.item():.4f}',
-            'changed_params': str(not torch.allclose(base_param_dict['single_transformer_blocks.0.attn.to_k.bias'],esd_param_dict['single_transformer_blocks.0.attn.to_k.bias'])),
         })
 
         model_pred = loss = target = xt = noise_pred_null = noise_pred_from = noise_pred_erase =  None
@@ -305,7 +283,7 @@ if __name__=="__main__":
     if erase_concept_from is None:
         erase_concept_from_ = erase_concept
         
-    save_file(esd_param_dict, f"{save_path}/esd-{erase_concept.replace(' ', '_')}-from-{erase_concept_from_.replace(' ', '_')}-{train_method.replace('-','')}.safetensors")
+    pipe.transformer.save_pretrained(f"{save_path}/esd-{erase_concept.replace(' ', '_')}-from-{erase_concept_from_.replace(' ', '_')}-{train_method.replace('-','')}.safetensors")
 
     pipe.transformer.eval()
     pipe = pipe.to(device)
